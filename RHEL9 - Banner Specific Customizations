@@ -1,0 +1,238 @@
+General Information
+This document outlines specific changes that are being made to RHEL9 servers in order to support Banner and its related software.  These changes are applied after the initial server deployment and server hardening, but prior to handing the server off to the DBAs.
+
+
+See how to add disks in RH9: 
+RHEL9 - Adding a Disk 
+
+General Customizations
+These apply to all deployed Banner servers, regardless of primary application.
+
+ 
+
+Allow logins for Banner Linux Admins
+
+
+
+realm permit -g ServerAdmins_DBA@cnuadmin.cnu.edu
+ 
+
+Allow ssh for Banner Linux Admins - Edit the sshd_config file and add the group name to the "AllowGroups" list.  The entries must be contained in quotes and in lower-case.
+
+
+
+sed -i '/AllowGroups/ s/$/, "serveradmins_dba"/' /etc/ssh/sshd_config
+ 
+
+Add sudoers access for the Banner Linux Admins
+
+
+
+echo '# CNU DBAs' >> /etc/sudoers
+echo '%ServerAdmins_DBA@cnuadmin.cnu.edu      ALL=(ALL) ALL' >> /etc/sudoers
+ 
+
+Banner Application Servers
+These only apply to the Banner application servers (running Tomcat).
+
+ 
+
+Add tomcat user to the wheel group
+
+
+
+useradd tomcat
+passwd tomcat
+# [Set PW]
+usermod -a -G wheel tomcat
+ 
+
+Ensure the NFS client is installed to pull files from database servers
+
+
+
+dnf install -y nfs-utils nfs4-acl-tools
+ 
+
+Remove the hardening blocks for NFS
+
+
+
+modprobe nfs        # NFS client
+modprobe lockd      # File locking support
+modprobe auth_rpcgss  # Security for NFSv4 (Kerberos optional)
+modprobe fscache    # Optional: caching for NFS client
+ 
+
+Re-Disable the NFS server daemon (clients don’t need the server daemon)
+
+
+
+systemctl disable nfs-server.service
+systemctl mask --now nfs-server.service
+ 
+
+Open firewall ports for servers running Banner 8 Self-Service (standard web ports)
+
+For Banner 8 SSB Application Servers
+
+
+firewall-cmd --zone=public --add-port=80/tcp --permanent
+firewall-cmd --zone=public --add-port=443/tcp --permanent
+firewall-cmd --reload
+ 
+
+Open firewall ports for servers running Banner 9 Self-Service (standard web port, redirected to non-standard Tomcat port)
+
+For Banner 9 SSB Application Servers
+
+
+firewall-cmd --zone=public --add-port=443/tcp --permanent
+firewall-cmd --add-forward-port=port=443:proto=tcp:toport=8443 --permanent
+firewall-cmd --reload 
+ 
+
+Open firewall ports for servers running Banner 9 Admin pages (non-standard web ports)
+
+For Banner 9 Admin Pages Application Servers
+
+
+firewall-cmd --zone=public --add-port=8445/tcp --permanent
+firewall-cmd --zone=public --add-port=8443/tcp --permanent
+firewall-cmd --reload
+ 
+
+Enable port redirect for the Banner Cashnet Connector Servers.  This assumes that end users will use the standard HTTPS port (443), but Tomcat will actually listen on port 8443.
+
+For Banner Cashnet Connector Servers
+
+
+firewall-cmd --add-forward-port=port=443:proto=tcp:toport=8443 --permanent
+firewall-cmd --reload 
+ 
+
+ 
+
+Banner Database Servers
+These only apply to the Banner database servers (running Oracle).
+
+ 
+
+Open firewall ports.
+
+For Oracle Database Servers
+
+
+firewall-cmd --zone=public --add-port=1521/tcp --permanent
+firewall-cmd --zone=public --add-port=3872/tcp --permanent
+firewall-cmd --zone=public --add-port=5501/tcp --permanent
+firewall-cmd --reload
+ 
+
+Edit /etc/sssd/sssd.conf to exclude specific users from AD loockups
+
+
+
+
+nano /etc/sssd/sssd.conf
+-----
+filter_groups = root,oracle,dba,banner,payroll
+filter_users = root,oracle,dba,banner,payroll
+-----
+systemctl restart sssd.service
+ 
+
+Enable X11 Forwarding for Oracle Installer.
+
+
+
+sed -i 's/X11Forwarding no/X11Forwarding yes/' /etc/ssh/sshd_config
+systemctl restart sshd
+ 
+
+Oracle Enterprise Manager
+Open firewall ports on the OEM server.
+
+
+
+firewall-cmd --zone=public --permanent --add-port=7803/tcp
+firewall-cmd --zone=public --permanent --add-port=7102/tcp
+firewall-cmd --zone=public --permanent --add-port=4903/tcp
+firewall-cmd --reload
+ 
+
+NFS Shares
+In this example, "db09pv.cnuadmin.cnu.edu" is the source server and "as72dv.cnuadmin.cnu.edu" is the destination/client server
+
+Source/Hosting Server (with the files/share)
+You'll need to know the User ID and the Group ID of the user that you want the remote client to appear as.  In this case, we want any files created by the client (AS72DV) to look like they are created and owned by the "banner" user that exists on the source server, DB09PV.  You can get these IDs from the /etc/passwd file.
+
+
+
+cat /etc/passwd | grep banner
+ 
+
+Sample Output
+
+
+# Sample output from DB09PV
+banner:x:504:600:Banner Admin:/home/banner:/bin/bash
+# Sample field order/format, for reference
+Username:Password:User_ID:Group_ID:Gecos_General_Info:Home_Directory:User_Shell
+ 
+
+Use the information gathered above and fill in the appropriate details in the exports file.
+
+Sample /etc/exports File
+
+
+# ------------------------
+# ESM Shares
+# ------------------------
+# AS72DV App Server
+/u01/esmshare as72dv.cnuadmin.cnu.edu(rw,async,no_all_squash,anonuid=504,anongid=600)
+ 
+
+Caution: The following permission change will greatly reduce the security of the shared folder, but this step is necessary to ensure successful access by the client.  Choose the directory you share with caution!
+
+ 
+
+Folder Permission Changes (to allow "nfsnobody")
+
+
+chmod o+rwx /u01/esmshare
+ 
+
+Enable and Refresh the Exports
+
+
+# Start the NFS Server service and enable it at boot
+systemctl start nfs-server.service
+systemctl enable nfs-server.service
+# Allow NFS through the firewall
+firewall-cmd --permanent --add-service=nfs
+firewall-cmd --reload
+# Reload the exports
+exportfs -r
+ 
+
+Re-Export Changes (Post other changes)
+
+
+exportfs -ra 
+ 
+
+Destination/Client Server (that needs access to the files/share)
+These example specify NFSv4.  This should be the default, but by specifying it here, we can reduce the connection time, as the server will only try the specified version, instead of trying to negotiate through multiple versions.
+
+# Make sure the nfs utilities are installed
+dnf install -y nfs-utils
+# Make your directory
+mkdir /u02/esmshare
+# Set directory permissions (EXAMPLE ONLY!)
+chmod 755 /u02/esmshare 
+# Manually test the mount
+mount -t nfs -o rw,vers=4 db09pv.cnuadmin.cnu.edu:/u01/esmshare /u02/esmshare
+ 
+Sample /etc/fstab Entry
+db09pv.cnuadmin.cnu.edu:/u02/esmshare	/u01/esmshare	nfs	rw,vers=4,async,intr,rsize=32768,wsize=32768 0 0
